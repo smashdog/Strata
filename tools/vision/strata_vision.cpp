@@ -23,6 +23,8 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
@@ -64,6 +66,70 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
     img = rest.substr(0, sp);
     out = rest.substr(sp + 1);
     return !img.empty() && !out.empty();
+}
+
+// The grid (nx columns, ny rows) the engine needs in the .sve header.  mtmd used to hand it over through the
+// decoder positions, but for a text model whose rope is not M-RoPE it now lays the image tokens on a line
+// (pos_type NORMAL): x = y = i, so the last position gives (n, 1) and the real grid is lost.  Recompute it here
+// from the very resize the dyn_size preprocessor applied, with the divisor pair of n as a generic fallback.
+
+struct ResizedSize { int w, h; };
+
+// Replicates mtmd's img_tool::calc_size_preserved_ratio (tools/mtmd/mtmd-image.cpp) for the dyn_size
+// preprocessor (longest_edge = 0): the resized width/height, aligned to `align`, kept within the pixel budget.
+// The float casts mirror the original so the rounding lands on the same pixels.
+ResizedSize calc_resized_size(int width, int height, int align, int min_pixels, int max_pixels) {
+    if (width <= 0 || height <= 0 || align <= 0) return {0, 0};
+    auto round_by = [align](float x) { return (int) std::round(x / (float) align) * align; };
+    auto ceil_by  = [align](float x) { return (int) std::ceil (x / (float) align) * align; };
+    auto floor_by = [align](float x) { return (int) std::floor(x / (float) align) * align; };
+    int w_bar = std::max(align, round_by((float) width));
+    int h_bar = std::max(align, round_by((float) height));
+    if (max_pixels > 0 && h_bar * w_bar > max_pixels) {
+        const float beta = std::sqrt((float) height * width / (float) max_pixels);
+        h_bar = std::max(align, floor_by(height / beta));
+        w_bar = std::max(align, floor_by(width  / beta));
+    } else if (min_pixels > 0 && h_bar * w_bar < min_pixels) {
+        const float beta = std::sqrt((float) min_pixels / ((float) height * width));
+        h_bar = ceil_by(height * beta);
+        w_bar = ceil_by(width  * beta);
+    }
+    return {w_bar, h_bar};
+}
+
+// Fallback: the divisor pair of n whose aspect ratio is closest to the picture's.  The resize preserves the
+// aspect ratio, so the true grid is this pair; used when the replicated resize cannot be validated against n
+// (a projector whose hparams were not modelled here).  nx follows the width, ny the height.
+bool grid_from_divisors(int n, int width, int height, int& nx, int& ny) {
+    if (n <= 0 || width <= 0 || height <= 0) return false;
+    const double target = (double) std::max(width, height) / (double) std::min(width, height);
+    int ba = 0, bb = 0; double bd = 1e300;
+    for (int d = 1; (long long) d * d <= n; ++d) {
+        if (n % d != 0) continue;
+        const int a = n / d, b = d;                          // a >= b
+        const double diff = std::abs((double) a / b - target);
+        if (diff < bd) { bd = diff; ba = a; bb = b; }
+    }
+    if (ba <= 0) return false;
+    if (width >= height) { nx = ba; ny = bb; } else { nx = bb; ny = ba; }
+    return nx > 0 && ny > 0 && nx * ny == n;
+}
+
+// n_merge / effective patch size for the dyn_size projector families, mirroring clip.cpp's hparams block.
+void dyn_grid_hparams(const std::string& proj, int patch_size, int proj_scale, int spatial_merge,
+                      int& eff_patch, int& n_merge) {
+    eff_patch = patch_size; n_merge = 1;
+    if (proj == "gemma4v" || proj == "gemma4uv") {
+        n_merge = proj_scale > 0 ? proj_scale : 3;           // pooling_kernel_size
+        if (proj == "gemma4uv") { eff_patch = patch_size * n_merge; n_merge = 1; }
+    } else if (proj == "qwen2vl_merger" || proj == "qwen2.5vl_merger" ||
+               proj == "qwen3vl_merger" || proj == "mimovl") {
+        n_merge = spatial_merge > 0 ? spatial_merge : 2;
+    } else if (proj_scale > 0) {
+        n_merge = proj_scale;
+    } else if (spatial_merge > 0) {
+        n_merge = spatial_merge;
+    }
 }
 
 }  // namespace
@@ -238,14 +304,36 @@ int main(int argc, char** argv) {
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count());
     // a vocab-only model reports no hparams, so the width comes from the projector: its output is the model's input
     int n_embd = 0;
+    int patch_size = 0, proj_scale = 0, spatial_merge = 0, gguf_min_pixels = 0, gguf_max_pixels = 0;
+    std::string proj_type;
     {
         gguf_init_params gp{true, nullptr};
         gguf_context* gg = gguf_init_from_file(mmproj.c_str(), gp);
-        const int64_t k = gg ? gguf_find_key(gg, "clip.vision.projection_dim") : -1;
-        if (k >= 0) n_embd = (int) gguf_get_val_u32(gg, k);
+        auto u32 = [&](const char* key, int& out) {
+            const int64_t k = gg ? gguf_find_key(gg, key) : -1;
+            if (k >= 0) out = (int) gguf_get_val_u32(gg, k);
+        };
+        u32("clip.vision.projection_dim", n_embd);
+        u32("clip.vision.patch_size", patch_size);
+        u32("clip.vision.projector.scale_factor", proj_scale);
+        u32("clip.vision.spatial_merge_size", spatial_merge);
+        u32("clip.vision.image_min_pixels", gguf_min_pixels);
+        u32("clip.vision.image_max_pixels", gguf_max_pixels);
+        const int64_t kp = gg ? gguf_find_key(gg, "clip.vision.projector_type") : -1;
+        if (kp >= 0) proj_type = gguf_get_val_str(gg, kp);
         if (gg) gguf_free(gg);
     }
     if (n_embd <= 0) { std::printf("ERR the vision encoder has no projection_dim\n"); std::fflush(stdout); return 1; }
+    // The grid the dyn_size preprocessor produces: align = patch*n_merge, pixel budget = tokens*align^2
+    // (clip.cpp set_limit_image_tokens).  --min/--max-tokens override the projector defaults, as in clip_init.
+    int eff_patch = 0, n_merge = 1;
+    dyn_grid_hparams(proj_type, patch_size, proj_scale, spatial_merge, eff_patch, n_merge);
+    const int grid_align = eff_patch * n_merge;
+    const long long patch_area = (long long) grid_align * grid_align;
+    const int min_pixels = min_tokens > 0 ? (int) std::min<long long>((long long) min_tokens * patch_area, INT32_MAX)
+                                          : gguf_min_pixels;
+    const int max_pixels = max_tokens > 0 ? (int) std::min<long long>((long long) max_tokens * patch_area, INT32_MAX)
+                                          : gguf_max_pixels;
     // Warm up at the LARGEST picture before READY: the encoder's GPU work buffers are allocated now, not at the first
     // real picture.  The server starts this process before the engine, so the engine sizes its expert cache from
     // what is really left; allocating ~1 GB later, on a GPU the engine has filled, made Windows page GPU memory and
@@ -309,10 +397,25 @@ int main(int argc, char** argv) {
         if (err.empty()) {
             const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ichunk);
             const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
-            // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
-            const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
-            const int nx = (int) last.x + 1, ny = (int) last.y + 1;
-            if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
+            const int W = (int) mtmd_bitmap_get_nx(bw.bitmap);
+            const int H = (int) mtmd_bitmap_get_ny(bw.bitmap);
+            int nx = 0, ny = 0;
+            bool grid_ok = false;
+            // M-RoPE models: the decoder positions carry the real grid (x = i % nx, y = i / nx).
+            if (mtmd_decode_use_mrope(ctx) && n > 0) {
+                const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
+                const int mx = (int) last.x + 1, my = (int) last.y + 1;
+                if (mx > 0 && my > 0 && mx * my == n) { nx = mx; ny = my; grid_ok = true; }
+            }
+            // Otherwise mtmd laid the tokens on a line (text rope is not M-RoPE) and the positions degenerate to
+            // (n, 1): recompute the grid from the same resize the preprocessor applied, validated against n.
+            if (!grid_ok && grid_align > 0) {
+                const ResizedSize rs = calc_resized_size(W, H, grid_align, min_pixels, max_pixels);
+                const int cx = rs.w / grid_align, cy = rs.h / grid_align;
+                if (cx > 0 && cy > 0 && cx * cy == n) { nx = cx; ny = cy; grid_ok = true; }
+            }
+            if (!grid_ok) grid_ok = grid_from_divisors(n, W, H, nx, ny);
+            if (!grid_ok) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
             // never silently produce many times the budget (I7, #3690): over the limit (a rounding margin of an eighth) the picture is refused
             if (err.empty() && max_tokens > 0 && n > max_tokens + max_tokens / 8)
                 err = "the picture became " + std::to_string(n) + " image tokens, over the limit of " + std::to_string(max_tokens) +
